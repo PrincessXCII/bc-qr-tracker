@@ -1,0 +1,1588 @@
+/*******************************
+ * SF QR Bath Concepts - Master Script (STABILIZED VERSION - FIXED)
+ * PURPOSE OF THIS VERSION:
+ * - Lighter onEdit
+ * - Prevent overlapping edits with LockService
+ * - No Dashboard rebuild inside onEdit
+ * - No immediate archive/delete inside onEdit
+ * - Queue completed QC cart tokens for later archive
+ * - FIXED: Blanking Forming scan cell no longer deletes the row
+ *
+ * RECOMMENDED TRIGGERS AFTER PASTING:
+ * 1) Install an Edit trigger for: onEdit
+ * 2) Install a Time-driven trigger every 5 min for: updateDashboardIfDirty
+ * 3) Install a Time-driven trigger every 5 min for: processArchiveQueue 3/30/2026
+ *******************************/
+
+// ====== CONFIG ======
+const SHEETS = {
+  STATUS_LOG: "Status Log",
+  DASHBOARD: "Dashboard",
+  TRACKER: "Tracker",
+  ARCHIVE: "Archive",
+  FORMING: "Forming",
+  FLEX: "Flex",
+  PITCHING: "Pitching",
+  SPRAYFOAM: "Sprayfoam",
+  BANDSAW: "Bandsaw",
+  QC: "QC",
+};
+
+const STATIONS_IN_ORDER = [
+  SHEETS.FORMING,
+  SHEETS.FLEX,
+  SHEETS.PITCHING,
+  SHEETS.SPRAYFOAM,
+  SHEETS.BANDSAW,
+  SHEETS.QC,
+];
+
+const FLEX_LIKE = [SHEETS.FLEX, SHEETS.PITCHING, SHEETS.SPRAYFOAM, SHEETS.BANDSAW];
+
+const PROP_KEYS = {
+  DASHBOARD_DIRTY: "DASHBOARD_DIRTY",
+  ARCHIVE_QUEUE: "ARCHIVE_QUEUE",
+};
+
+// --- Column maps (1-based) ---
+// Forming:
+// A Token, B Order#, C Part#, D Item Size, E Customer, F DUE DATE,
+// G autofill Date, H Scan Here, I Success, J Name, K Scrap, L Defective
+const FORMING_COL = {
+  TOKEN: 1,
+  ORDER: 2,
+  PART: 3,
+  SIZE: 4,
+  CUSTOMER: 5,
+  DUEDATE: 6,
+  TIME: 7,
+  SCAN: 8,
+  SUCCESS: 9,
+  NAME: 10,
+  SCRAP: 11,
+  DEFECT: 12,
+};
+
+// Flex-like:
+// A Token, B Order#, C Part#, D Item Size, E autofill Date,
+// F Name/Pass, G Scrap, H Defective
+const FLEXLIKE_COL = {
+  TOKEN: 1,
+  ORDER: 2,
+  PART: 3,
+  SIZE: 4,
+  TIME: 5,
+  NAME: 6,
+  SCRAP: 7,
+  DEFECT: 8,
+};
+
+// QC:
+// A Token, B Order#, C Part#, D Item Size, E autofill Date,
+// F Name/Pass, G Cart#, H Paint Room, I Pending Fix, J Scrap, K Defective
+const QC_COL = {
+  TOKEN: 1,
+  ORDER: 2,
+  PART: 3,
+  SIZE: 4,
+  TIME: 5,
+  NAME: 6,
+  CART: 7,
+  PAINT: 8,
+  PENDING: 9,
+  SCRAP: 10,
+  DEFECT: 11,
+};
+
+// Status Log:
+// A Token, B misc/name, C Latest Time, D Area, E Cart,
+// F Order#, G Part#, H Size, I Customer, J Due Date, K Status
+const LOG_COL = {
+  TOKEN: 1,
+  NAME: 2,
+  TIME: 3,
+  AREA: 4,
+  CART: 5,
+  ORDER: 6,
+  PART: 7,
+  SIZE: 8,
+  CUSTOMER: 9,
+  DUEDATE: 10,
+  COMBINED: 11,
+};
+
+// ====== MENUS ======
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Tracker Tools")
+    .addItem("🔍 Search Token", "fetchTokenData")
+    .addItem("🛠 Process Current Forming Row", "processCurrentFormingRowManually")
+    .addSeparator()
+    .addItem("📊 Update Dashboard Now", "updateDashboard")
+    .addItem("📊 Update Dashboard If Dirty", "updateDashboardIfDirty")
+    .addSeparator()
+    .addItem("📦 Process Archive Queue", "processArchiveQueue")
+    .addItem("📦 Archive Old Entries", "archiveOldEntries")
+    .addToUi();
+}
+
+// ====== MAIN EDIT TRIGGER ======
+function onEdit(e) {
+  if (!e || !e.range) return;
+
+  const lock = LockService.getDocumentLock();
+
+  try {
+    if (!lock.tryLock(3000)) return;
+
+    const ss = e.source;
+    const sheet = e.range.getSheet();
+    const sheetName = sheet.getName();
+    const row = e.range.getRow();
+    const col = e.range.getColumn();
+
+    if (row <= 1) return;
+    if (!isRelevantEdit_(sheetName, col)) return;
+
+    if (sheetName === SHEETS.FORMING && col === FORMING_COL.SCAN) {
+      handleFormingScanEdit_(ss, sheet, row, e.range);
+      return;
+    }
+
+    if (sheetName === SHEETS.FORMING && col === FORMING_COL.TOKEN) {
+      handleFormingTokenEdit_(ss, row, e.range);
+      return;
+    }
+
+    if (sheetName === SHEETS.FORMING && [FORMING_COL.NAME, FORMING_COL.SCRAP, FORMING_COL.DEFECT].includes(col)) {
+      handleFormingStatusEdit_(ss, sheet, row, col, e.range);
+      return;
+    }
+
+    if (FLEX_LIKE.includes(sheetName)) {
+      if (col === FLEXLIKE_COL.TOKEN) {
+        handleWorkflowValidationForTokenEntry_(ss, sheet, row, e.range);
+        return;
+      }
+
+      if ([FLEXLIKE_COL.NAME, FLEXLIKE_COL.SCRAP, FLEXLIKE_COL.DEFECT].includes(col)) {
+        handleFlexLikeStatusEdit_(ss, sheet, row, col, e.range);
+        return;
+      }
+    }
+
+    if (sheetName === SHEETS.QC) {
+      if (col === QC_COL.TOKEN) {
+        handleWorkflowValidationForTokenEntry_(ss, sheet, row, e.range);
+        return;
+      }
+
+      if ([QC_COL.NAME, QC_COL.CART, QC_COL.PAINT, QC_COL.PENDING, QC_COL.SCRAP, QC_COL.DEFECT].includes(col)) {
+        handleQCEdit_(ss, sheet, row, col, e.range);
+        return;
+      }
+    }
+
+  } catch (err) {
+    logError_("onEdit", err);
+    try {
+      e.source.toast("Script error: " + err.message, "SF QR", 5);
+    } catch (toastErr) {}
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (releaseErr) {}
+  }
+}
+
+// ====== RELEVANCY FILTER ======
+function isRelevantEdit_(sheetName, col) {
+  if (sheetName === SHEETS.FORMING) {
+    return [
+      FORMING_COL.TOKEN,
+      FORMING_COL.SCAN,
+      FORMING_COL.NAME,
+      FORMING_COL.SCRAP,
+      FORMING_COL.DEFECT
+    ].includes(col);
+  }
+
+  if (FLEX_LIKE.includes(sheetName)) {
+    return [
+      FLEXLIKE_COL.TOKEN,
+      FLEXLIKE_COL.NAME,
+      FLEXLIKE_COL.SCRAP,
+      FLEXLIKE_COL.DEFECT
+    ].includes(col);
+  }
+
+  if (sheetName === SHEETS.QC) {
+    return [
+      QC_COL.TOKEN,
+      QC_COL.NAME,
+      QC_COL.CART,
+      QC_COL.PAINT,
+      QC_COL.PENDING,
+      QC_COL.SCRAP,
+      QC_COL.DEFECT
+    ].includes(col);
+  }
+
+  return false;
+}
+
+// ====== HANDLERS ======
+function handleFormingScanEdit_(ss, sheet, row, editedRange) {
+  const tokenValue = sheet.getRange(row, FORMING_COL.TOKEN).getValue();
+  if (!tokenValue) {
+    toastOrAlert_(ss, "Scan token # first");
+    editedRange.clearContent();
+    return;
+  }
+
+  const input = editedRange.getValue();
+
+  // IMPORTANT FIX:
+  // A blank scan cell should do nothing.
+  // It should NOT delete the row anywhere.
+  if (input === "") {
+    return;
+  }
+
+  if (!(typeof input === "string" && input.includes("|"))) return;
+
+  const existing = sheet.getRange(row, FORMING_COL.ORDER, 1, 5).getValues()[0]; // B-F
+  const isOccupied = existing.some(v => v !== "" && v !== null);
+  if (isOccupied) {
+    editedRange.clearContent();
+    return;
+  }
+
+  const split = input.split("|").map(s => s.trim()).filter(Boolean);
+  const padded = [...split];
+  while (padded.length < 5) padded.push("");
+
+  sheet.getRange(row, FORMING_COL.ORDER, 1, 5).setValues([padded.slice(0, 5)]);
+
+  const ts = now_();
+  sheet.getRange(row, FORMING_COL.TIME).setValue(ts);
+  sheet.getRange(row, FORMING_COL.SUCCESS).setValue("✅");
+  editedRange.clearContent();
+
+  // Copy A-D to other station tabs
+  const dataToCopy = sheet.getRange(row, 1, 1, 4).getValues();
+
+  STATIONS_IN_ORDER.forEach(name => {
+    if (name === SHEETS.FORMING) return;
+    const target = ss.getSheetByName(name);
+    if (!target) return;
+    target.getRange(row, 1, 1, 4).setValues(dataToCopy);
+  });
+
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  const formingRow = getFormingRowByRow_(sheet, row);
+
+  updateStatusLog_(logSheet, tokenValue, {
+    area: SHEETS.FORMING,
+    name: "",
+    timestamp: ts,
+    cart: "",
+    combinedStatus: "Forming",
+    formingRow,
+  });
+
+  markDashboardDirty_();
+}
+
+function handleFormingTokenEdit_(ss, row, editedRange) {
+  const token = editedRange.getValue();
+  if (!token) return;
+
+  STATIONS_IN_ORDER.forEach(name => {
+    if (name === SHEETS.FORMING) return;
+    const target = ss.getSheetByName(name);
+    if (target) target.getRange(row, 1).setValue(token);
+  });
+}
+
+function handleWorkflowValidationForTokenEntry_(ss, sheet, row, editedRange) {
+  const sheetName = sheet.getName();
+  const token = editedRange.getValue();
+  if (!token) return;
+
+  const ok = validateWorkflowSequence_(ss, token, sheetName);
+  if (!ok) {
+    toastOrAlert_(ss, "Workflow Error: this token is not allowed here yet (or is Scrap/Defective).");
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).clearContent();
+  }
+}
+
+function handleFormingStatusEdit_(ss, sheet, row, col, editedRange) {
+  const token = sheet.getRange(row, FORMING_COL.TOKEN).getValue();
+  if (!token) return;
+
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  const formingRow = getFormingRowByRow_(sheet, row);
+  const val = editedRange.getValue();
+  if (!val) return;
+
+  const ts = now_();
+  sheet.getRange(row, FORMING_COL.TIME).setValue(ts);
+
+  let combinedStatus = "Forming";
+  let name = val;
+
+  if (col === FORMING_COL.NAME) {
+    combinedStatus = "Forming";
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground(null);
+  } else if (col === FORMING_COL.SCRAP) {
+    combinedStatus = "Forming Scrap";
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground("#f4cccc");
+  } else if (col === FORMING_COL.DEFECT) {
+    combinedStatus = "Forming Defective";
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground("#f4cccc");
+  }
+
+  updateStatusLog_(logSheet, token, {
+    area: SHEETS.FORMING,
+    name,
+    timestamp: ts,
+    cart: "",
+    combinedStatus,
+    formingRow,
+  });
+
+  markDashboardDirty_();
+}
+
+function handleFlexLikeStatusEdit_(ss, sheet, row, col, editedRange) {
+  const token = sheet.getRange(row, FLEXLIKE_COL.TOKEN).getValue();
+  if (!token) return;
+
+  const val = editedRange.getValue();
+  if (!val) return;
+
+  const ts = now_();
+  sheet.getRange(row, FLEXLIKE_COL.TIME).setValue(ts);
+
+  const formingSheet = ss.getSheetByName(SHEETS.FORMING);
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  const sheetName = sheet.getName();
+  const formingRow = getFormingRowDataByToken_(formingSheet, token);
+
+  let combinedStatus = sheetName;
+  let name = val;
+
+  if (col === FLEXLIKE_COL.NAME) {
+    combinedStatus = sheetName;
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground(null);
+  } else if (col === FLEXLIKE_COL.SCRAP) {
+    combinedStatus = `${sheetName} Scrap`;
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground("#f4cccc");
+  } else if (col === FLEXLIKE_COL.DEFECT) {
+    combinedStatus = `${sheetName} Defective`;
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground("#f4cccc");
+  }
+
+  updateStatusLog_(logSheet, token, {
+    area: sheetName,
+    name,
+    timestamp: ts,
+    cart: "",
+    combinedStatus,
+    formingRow,
+  });
+
+  markDashboardDirty_();
+}
+
+function handleQCEdit_(ss, sheet, row, col, editedRange) {
+  const token = sheet.getRange(row, QC_COL.TOKEN).getValue();
+  if (!token) return;
+
+  const val = editedRange.getValue();
+  if (!val) return;
+
+  const ts = now_();
+  sheet.getRange(row, QC_COL.TIME).setValue(ts);
+
+  const formingSheet = ss.getSheetByName(SHEETS.FORMING);
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  const formingRow = getFormingRowDataByToken_(formingSheet, token);
+
+  const qcName = sheet.getRange(row, QC_COL.NAME).getValue() || "";
+  const cart = sheet.getRange(row, QC_COL.CART).getValue() || "";
+
+  if (col === QC_COL.NAME) {
+    updateStatusLog_(logSheet, token, {
+      area: SHEETS.QC,
+      name: val,
+      timestamp: ts,
+      cart: cart,
+      combinedStatus: "QC",
+      formingRow,
+    });
+
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground(null);
+    markDashboardDirty_();
+    return;
+  }
+
+  if (col === QC_COL.CART) {
+    if (!qcName) {
+      toastOrAlert_(ss, "Please scan your name in column F first.");
+      sheet.getRange(row, QC_COL.CART).clearContent();
+      return;
+    }
+
+    updateStatusLog_(logSheet, token, {
+      area: SHEETS.QC,
+      name: qcName,
+      timestamp: ts,
+      cart: val,
+      combinedStatus: `Cart - ${val}`,
+      formingRow,
+    });
+
+    queueArchiveToken_(token);
+    markDashboardDirty_();
+    return;
+  }
+
+  if (col === QC_COL.PAINT) {
+    updateStatusLog_(logSheet, token, {
+      area: SHEETS.QC,
+      name: qcName,
+      timestamp: ts,
+      cart: cart,
+      combinedStatus: "Paint Room",
+      formingRow,
+    });
+
+    markDashboardDirty_();
+    return;
+  }
+
+  if (col === QC_COL.PENDING) {
+    updateStatusLog_(logSheet, token, {
+      area: SHEETS.QC,
+      name: qcName,
+      timestamp: ts,
+      cart: cart,
+      combinedStatus: "Pending Fix",
+      formingRow,
+    });
+
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground("#fff2cc");
+    markDashboardDirty_();
+    return;
+  }
+
+  if (col === QC_COL.SCRAP) {
+    updateStatusLog_(logSheet, token, {
+      area: SHEETS.QC,
+      name: val,
+      timestamp: ts,
+      cart: "",
+      combinedStatus: "QC Scrap",
+      formingRow,
+    });
+
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground("#f4cccc");
+    markDashboardDirty_();
+    return;
+  }
+
+  if (col === QC_COL.DEFECT) {
+    updateStatusLog_(logSheet, token, {
+      area: SHEETS.QC,
+      name: val,
+      timestamp: ts,
+      cart: "",
+      combinedStatus: "QC Defective",
+      formingRow,
+    });
+
+    sheet.getRange(row, 1, 1, sheet.getLastColumn()).setBackground("#f4cccc");
+    markDashboardDirty_();
+  }
+}
+
+// ====== STATUS LOG ======
+function updateStatusLog_(logSheet, token, payload) {
+  if (!logSheet || !token) return;
+
+  const lastCol = logSheet.getLastColumn();
+  const lastRow = logSheet.getLastRow();
+  const data = lastRow >= 2
+    ? logSheet.getRange(2, 1, lastRow - 1, Math.max(lastCol, LOG_COL.COMBINED)).getValues()
+    : [];
+
+  let r = -1;
+  for (let i = 0; i < data.length; i++) {
+    if ((data[i][LOG_COL.TOKEN - 1] || "").toString().trim() === token.toString().trim()) {
+      r = i + 2;
+      break;
+    }
+  }
+
+  if (r === -1) {
+    const newRow = new Array(lastCol).fill("");
+    newRow[LOG_COL.TOKEN - 1] = token;
+    logSheet.appendRow(newRow);
+    r = logSheet.getLastRow();
+  }
+
+  const rowValues = logSheet.getRange(r, 1, 1, lastCol).getValues()[0];
+
+  rowValues[LOG_COL.NAME - 1] = payload.name || rowValues[LOG_COL.NAME - 1] || "";
+  rowValues[LOG_COL.TIME - 1] = payload.timestamp;
+  rowValues[LOG_COL.AREA - 1] = payload.area;
+  rowValues[LOG_COL.CART - 1] = payload.cart || "";
+
+  const fr = payload.formingRow || [];
+  if (fr.length >= 5) {
+    rowValues[LOG_COL.ORDER - 1] = fr[0] || rowValues[LOG_COL.ORDER - 1];
+    rowValues[LOG_COL.PART - 1] = fr[1] || rowValues[LOG_COL.PART - 1];
+    rowValues[LOG_COL.SIZE - 1] = fr[2] || rowValues[LOG_COL.SIZE - 1];
+    rowValues[LOG_COL.CUSTOMER - 1] = fr[3] || rowValues[LOG_COL.CUSTOMER - 1];
+    if (fr[4] !== "" && fr[4] !== null) {
+      rowValues[LOG_COL.DUEDATE - 1] = fr[4];
+    }
+  }
+
+  rowValues[LOG_COL.COMBINED - 1] = payload.combinedStatus;
+
+  logSheet.getRange(r, 1, 1, lastCol).setValues([rowValues]);
+}
+
+function getFormingRowDataByToken_(formingSheet, token) {
+  if (!formingSheet) return [];
+
+  const lastRow = formingSheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const data = formingSheet.getRange(2, 1, lastRow - 1, Math.max(formingSheet.getLastColumn(), FORMING_COL.DUEDATE)).getValues();
+
+  for (let i = 0; i < data.length; i++) {
+    if ((data[i][FORMING_COL.TOKEN - 1] || "").toString().trim() === token.toString().trim()) {
+      return [
+        data[i][FORMING_COL.ORDER - 1],
+        data[i][FORMING_COL.PART - 1],
+        data[i][FORMING_COL.SIZE - 1],
+        data[i][FORMING_COL.CUSTOMER - 1],
+        data[i][FORMING_COL.DUEDATE - 1],
+      ];
+    }
+  }
+  return [];
+}
+
+function getFormingRowByRow_(formingSheet, row) {
+  return formingSheet.getRange(row, FORMING_COL.ORDER, 1, 5).getValues()[0];
+}
+
+// ====== WORKFLOW VALIDATION ======
+function validateWorkflowSequence_(ss, token, currentSheetName) {
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  if (!logSheet) return true;
+
+  const lastRow = logSheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  const data = logSheet.getRange(2, 1, lastRow - 1, Math.max(logSheet.getLastColumn(), LOG_COL.COMBINED)).getValues();
+
+  let logRow = null;
+  for (let i = 0; i < data.length; i++) {
+    if ((data[i][LOG_COL.TOKEN - 1] || "").toString().trim() === token.toString().trim()) {
+      logRow = data[i];
+      break;
+    }
+  }
+  if (!logRow) return false;
+
+  const combined = (logRow[LOG_COL.COMBINED - 1] || "").toString().toLowerCase();
+  if (combined.includes("scrap") || combined.includes("defective")) return false;
+
+  const lastArea = (logRow[LOG_COL.AREA - 1] || "").toString();
+  const lastIdx = STATIONS_IN_ORDER.indexOf(lastArea);
+  const curIdx = STATIONS_IN_ORDER.indexOf(currentSheetName);
+
+  if (curIdx === -1) return true;
+  if (lastIdx === -1) return false;
+
+  return curIdx <= lastIdx + 1;
+}
+
+// ====== DASHBOARD ======
+function updateDashboard() {
+  const lock = LockService.getDocumentLock();
+
+  try {
+    lock.waitLock(8000);
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const dashboard = ss.getSheetByName(SHEETS.DASHBOARD) || ss.insertSheet(SHEETS.DASHBOARD);
+    const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+    if (!logSheet) return;
+
+    dashboard.clear();
+
+    const headers = ["Due Date", "Forming", "Flex", "Pitching", "Sprayfoam", "Bandsaw", "QC"];
+    dashboard.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+    const lastRow = logSheet.getLastRow();
+    if (lastRow < 2) {
+      clearDashboardDirty_();
+      ss.toast("Dashboard updated ✅", "Dashboard", 3);
+      return;
+    }
+
+    const data = logSheet.getRange(2, 1, lastRow - 1, Math.max(logSheet.getLastColumn(), LOG_COL.COMBINED)).getValues();
+    const summary = {};
+
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+
+      const due = row[LOG_COL.DUEDATE - 1];
+      if (!due) continue;
+
+      const combined = (row[LOG_COL.COMBINED - 1] || "").toString().toLowerCase();
+      if (combined.includes("scrap") || combined.includes("defective")) continue;
+      if (combined.startsWith("cart -")) continue;
+
+      const area = (row[LOG_COL.AREA - 1] || "").toString();
+      if (!STATIONS_IN_ORDER.includes(area)) continue;
+
+      const key = formatDateKey_(due);
+
+      if (!summary[key]) {
+        summary[key] = { Forming: 0, Flex: 0, Pitching: 0, Sprayfoam: 0, Bandsaw: 0, QC: 0 };
+      }
+
+      summary[key][area] = (summary[key][area] || 0) + 1;
+    }
+
+    const dates = Object.keys(summary).sort((a, b) => new Date(a) - new Date(b));
+    const output = dates.map(d => [
+      d,
+      summary[d].Forming || 0,
+      summary[d].Flex || 0,
+      summary[d].Pitching || 0,
+      summary[d].Sprayfoam || 0,
+      summary[d].Bandsaw || 0,
+      summary[d].QC || 0,
+    ]);
+
+    if (output.length) {
+      dashboard.getRange(2, 1, output.length, headers.length).setValues(output);
+    }
+
+    clearDashboardDirty_();
+    ss.toast("Dashboard updated ✅", "Dashboard", 3);
+  } catch (err) {
+    logError_("updateDashboard", err);
+    throw err;
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (releaseErr) {}
+  }
+}
+
+function updateDashboardIfDirty() {
+  const props = PropertiesService.getDocumentProperties();
+  const isDirty = props.getProperty(PROP_KEYS.DASHBOARD_DIRTY) === "true";
+  if (isDirty) updateDashboard();
+}
+
+function markDashboardDirty_() {
+  PropertiesService.getDocumentProperties().setProperty(PROP_KEYS.DASHBOARD_DIRTY, "true");
+}
+
+function clearDashboardDirty_() {
+  PropertiesService.getDocumentProperties().setProperty(PROP_KEYS.DASHBOARD_DIRTY, "false");
+}
+
+// ====== ARCHIVE QUEUE ======
+function queueArchiveToken_(token) {
+  if (!token) return;
+
+  const props = PropertiesService.getDocumentProperties();
+  const currentRaw = props.getProperty(PROP_KEYS.ARCHIVE_QUEUE) || "[]";
+  let queue = [];
+
+  try {
+    queue = JSON.parse(currentRaw);
+  } catch (err) {
+    queue = [];
+  }
+
+  const tokenTrim = token.toString().trim();
+  if (!queue.includes(tokenTrim)) {
+    queue.push(tokenTrim);
+    props.setProperty(PROP_KEYS.ARCHIVE_QUEUE, JSON.stringify(queue));
+  }
+}
+
+function processArchiveQueue() {
+  const lock = LockService.getDocumentLock();
+
+  try {
+    lock.waitLock(20000);
+
+    const props = PropertiesService.getDocumentProperties();
+    const raw = props.getProperty(PROP_KEYS.ARCHIVE_QUEUE) || "[]";
+
+    let queue = [];
+    try {
+      queue = JSON.parse(raw);
+    } catch (err) {
+      queue = [];
+    }
+
+    if (!queue.length) return;
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const remaining = [];
+
+    for (let i = 0; i < queue.length; i++) {
+      const token = queue[i];
+      try {
+        const archived = archiveSingleToken_(ss, token);
+        if (!archived) remaining.push(token);
+      } catch (err) {
+        logError_("processArchiveQueue token " + token, err);
+        remaining.push(token);
+      }
+    }
+
+    props.setProperty(PROP_KEYS.ARCHIVE_QUEUE, JSON.stringify(remaining));
+  } catch (err) {
+    logError_("processArchiveQueue", err);
+    throw err;
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (releaseErr) {}
+  }
+}
+
+function archiveSingleToken_(ss, token) {
+  const statusLogSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  const archiveSheet = ss.getSheetByName(SHEETS.ARCHIVE);
+  if (!statusLogSheet || !archiveSheet) return false;
+
+  if (tokenExistsInColA_(archiveSheet, token)) return true;
+
+  const lastRow = statusLogSheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  const logData = statusLogSheet.getRange(2, 1, lastRow - 1, Math.max(statusLogSheet.getLastColumn(), LOG_COL.COMBINED)).getValues();
+
+  let logRow = null;
+  let logRowIndex = -1;
+
+  for (let i = 0; i < logData.length; i++) {
+    const t = (logData[i][LOG_COL.TOKEN - 1] || "").toString().trim();
+    if (t === token.toString().trim()) {
+      logRow = logData[i];
+      logRowIndex = i + 2;
+      break;
+    }
+  }
+
+  if (!logRow) return false;
+
+  const cartVal = (logRow[LOG_COL.CART - 1] || "").toString().trim();
+  const combined = (logRow[LOG_COL.COMBINED - 1] || "").toString().trim();
+  if (!cartVal) return false;
+  if (!/^Cart\s*-\s*/i.test(combined)) return false;
+
+  const out = buildArchiveRow_(ss, token, logRow);
+  archiveSheet.appendRow(out);
+
+  deleteTokenFromSheets_(ss, [token], STATIONS_IN_ORDER);
+  if (logRowIndex > 0) statusLogSheet.deleteRow(logRowIndex);
+
+  return true;
+}
+
+// ====== ARCHIVE MANUAL ======
+function archiveOldEntries() {
+  const lock = LockService.getDocumentLock();
+
+  try {
+    lock.waitLock(20000);
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const statusLogSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+    const archiveSheet = ss.getSheetByName(SHEETS.ARCHIVE);
+    if (!statusLogSheet || !archiveSheet) {
+      SpreadsheetApp.getUi().alert("Archive", "Missing Status Log or Archive sheet.", SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+
+    const ui = SpreadsheetApp.getUi();
+    const response = ui.prompt(
+      "Archive Old Entries",
+      "Enter the number of days back from today to archive (example: 7 for entries older than 7 days):",
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (response.getSelectedButton() === ui.Button.CANCEL) return;
+
+    const days = parseInt(response.getResponseText(), 10);
+    if (isNaN(days) || days < 0) {
+      ui.alert("Invalid input", "Please enter a valid number of days.", ui.ButtonSet.OK);
+      return;
+    }
+
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+
+    const lastRow = statusLogSheet.getLastRow();
+    if (lastRow < 2) {
+      ui.alert("Archive", "No entries found in Status Log.", ui.ButtonSet.OK);
+      return;
+    }
+
+    const logData = statusLogSheet.getRange(2, 1, lastRow - 1, Math.max(statusLogSheet.getLastColumn(), LOG_COL.COMBINED)).getValues();
+    const tokensToArchive = [];
+    const rowsToDeleteFromLog = [];
+    const archiveRows = [];
+
+    for (let i = 0; i < logData.length; i++) {
+      const r = logData[i];
+      const ts = r[LOG_COL.TIME - 1];
+      if (!ts) continue;
+
+      const latestTime = new Date(ts);
+      if (latestTime >= cutoff) continue;
+
+      const token = r[LOG_COL.TOKEN - 1];
+      if (!token) continue;
+
+      tokensToArchive.push(token);
+      rowsToDeleteFromLog.push(i + 2);
+      archiveRows.push(buildArchiveRow_(ss, token, r));
+    }
+
+    if (!archiveRows.length) {
+      ui.alert("Archive", "No entries matched the cutoff date.", ui.ButtonSet.OK);
+      return;
+    }
+
+    archiveSheet.getRange(archiveSheet.getLastRow() + 1, 1, archiveRows.length, archiveRows[0].length).setValues(archiveRows);
+    deleteTokenFromSheets_(ss, tokensToArchive, STATIONS_IN_ORDER);
+
+    for (let i = rowsToDeleteFromLog.length - 1; i >= 0; i--) {
+      statusLogSheet.deleteRow(rowsToDeleteFromLog[i]);
+    }
+
+    ui.alert("Archive Complete", `${archiveRows.length} tokens archived and removed from all tabs.`, ui.ButtonSet.OK);
+  } catch (err) {
+    logError_("archiveOldEntries", err);
+    throw err;
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (releaseErr) {}
+  }
+}
+
+function buildArchiveRow_(ss, token, logRow) {
+  const out = new Array(38).fill("");
+
+  out[0]  = logRow[LOG_COL.TOKEN - 1] || "";
+  out[1]  = logRow[LOG_COL.NAME - 1] || "";
+  out[2]  = logRow[LOG_COL.TIME - 1] || "";
+  out[3]  = logRow[LOG_COL.AREA - 1] || "";
+  out[4]  = logRow[LOG_COL.CART - 1] || "";
+  out[5]  = logRow[LOG_COL.ORDER - 1] || "";
+  out[6]  = logRow[LOG_COL.PART - 1] || "";
+  out[7]  = logRow[LOG_COL.SIZE - 1] || "";
+  out[8]  = logRow[LOG_COL.CUSTOMER - 1] || "";
+  out[9]  = logRow[LOG_COL.DUEDATE - 1] || "";
+  out[10] = logRow[LOG_COL.COMBINED - 1] || "";
+
+  const formingInfo = getStationInfoByToken_(ss.getSheetByName(SHEETS.FORMING), SHEETS.FORMING, token) || {};
+  const flexInfo    = getStationInfoByToken_(ss.getSheetByName(SHEETS.FLEX), SHEETS.FLEX, token) || {};
+  const pitchInfo   = getStationInfoByToken_(ss.getSheetByName(SHEETS.PITCHING), SHEETS.PITCHING, token) || {};
+  const sfInfo      = getStationInfoByToken_(ss.getSheetByName(SHEETS.SPRAYFOAM), SHEETS.SPRAYFOAM, token) || {};
+  const bsInfo      = getStationInfoByToken_(ss.getSheetByName(SHEETS.BANDSAW), SHEETS.BANDSAW, token) || {};
+  const qcExtras    = getQcExtrasByToken_(ss.getSheetByName(SHEETS.QC), token) || {};
+
+  out[11] = formingInfo.name || "";
+  out[12] = formingInfo.time || "";
+
+  out[13] = flexInfo.name || "";
+  out[14] = flexInfo.time || "";
+
+  out[15] = pitchInfo.name || "";
+  out[16] = pitchInfo.time || "";
+
+  out[17] = sfInfo.name || "";
+  out[18] = sfInfo.time || "";
+
+  out[19] = bsInfo.name || "";
+  out[20] = bsInfo.time || "";
+
+  out[21] = qcExtras.name || "";
+  out[22] = qcExtras.time || "";
+  out[23] = qcExtras.cart || "";
+  out[24] = qcExtras.paint || "";
+  out[25] = qcExtras.pending || "";
+
+  out[26] = formingInfo.scrap || "";
+  out[27] = formingInfo.defect || "";
+
+  out[28] = flexInfo.scrap || "";
+  out[29] = flexInfo.defect || "";
+
+  out[30] = pitchInfo.scrap || "";
+  out[31] = pitchInfo.defect || "";
+
+  out[32] = sfInfo.scrap || "";
+  out[33] = sfInfo.defect || "";
+
+  out[34] = bsInfo.scrap || "";
+  out[35] = bsInfo.defect || "";
+
+  out[36] = qcExtras.scrap || "";
+  out[37] = qcExtras.defect || "";
+
+  return out;
+}
+
+// ====== TRACKER ======
+function fetchTokenData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tracker = ss.getSheetByName(SHEETS.TRACKER);
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  if (!tracker || !logSheet) return;
+
+  const token = (tracker.getRange("A2").getValue() || "").toString().trim();
+  if (!token) {
+    SpreadsheetApp.getUi().alert("Please enter a token in A2");
+    return;
+  }
+
+  tracker.getRange("C2:G2").clearContent();
+  tracker.getRange("B7:E12").clearContent();
+
+  const lastRow = logSheet.getLastRow();
+  const logData = lastRow >= 2
+    ? logSheet.getRange(2, 1, lastRow - 1, Math.max(logSheet.getLastColumn(), LOG_COL.COMBINED)).getValues()
+    : [];
+
+  let logRow = null;
+  for (let i = 0; i < logData.length; i++) {
+    if ((logData[i][LOG_COL.TOKEN - 1] || "").toString().trim() === token) {
+      logRow = logData[i];
+      break;
+    }
+  }
+
+  if (logRow) {
+    tracker.getRange("C2").setValue(logRow[LOG_COL.ORDER - 1] || "");
+    tracker.getRange("D2").setValue(logRow[LOG_COL.PART - 1] || "");
+    tracker.getRange("E2").setValue(logRow[LOG_COL.SIZE - 1] || "");
+    tracker.getRange("F2").setValue(logRow[LOG_COL.CUSTOMER - 1] || "");
+    tracker.getRange("G2").setValue(logRow[LOG_COL.DUEDATE - 1] || "");
+  }
+
+  const steps = [
+    { name: SHEETS.FORMING, row: 7 },
+    { name: SHEETS.FLEX, row: 8 },
+    { name: SHEETS.PITCHING, row: 9 },
+    { name: SHEETS.SPRAYFOAM, row: 10 },
+    { name: SHEETS.BANDSAW, row: 11 },
+    { name: SHEETS.QC, row: 12 },
+  ];
+
+  steps.forEach(s => {
+    tracker.getRange(`A${s.row}`).setValue(s.name);
+
+    const sh = ss.getSheetByName(s.name);
+    if (!sh) return;
+
+    const info = getStationInfoByToken_(sh, s.name, token);
+    if (!info) return;
+
+    tracker.getRange(`B${s.row}`).setValue(info.name || "");
+    tracker.getRange(`C${s.row}`).setValue(info.time || "");
+    tracker.getRange(`D${s.row}`).setValue(info.scrap || "");
+    tracker.getRange(`E${s.row}`).setValue(info.defect || "");
+  });
+
+  ss.toast("Search complete ✅", "Tracker", 3);
+}
+
+function getStationInfoByToken_(sheet, sheetName, token) {
+  if (!sheet) return null;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+  for (let i = 0; i < data.length; i++) {
+    if ((data[i][0] || "").toString().trim() !== token.toString().trim()) continue;
+
+    if (sheetName === SHEETS.FORMING) {
+      return {
+        name: data[i][FORMING_COL.NAME - 1] || "",
+        time: data[i][FORMING_COL.TIME - 1] || "",
+        scrap: data[i][FORMING_COL.SCRAP - 1] || "",
+        defect: data[i][FORMING_COL.DEFECT - 1] || "",
+      };
+    }
+
+    if (FLEX_LIKE.includes(sheetName)) {
+      return {
+        name: data[i][FLEXLIKE_COL.NAME - 1] || "",
+        time: data[i][FLEXLIKE_COL.TIME - 1] || "",
+        scrap: data[i][FLEXLIKE_COL.SCRAP - 1] || "",
+        defect: data[i][FLEXLIKE_COL.DEFECT - 1] || "",
+      };
+    }
+
+    if (sheetName === SHEETS.QC) {
+      return {
+        name: data[i][QC_COL.NAME - 1] || "",
+        time: data[i][QC_COL.TIME - 1] || "",
+        scrap: data[i][QC_COL.SCRAP - 1] || "",
+        defect: data[i][QC_COL.DEFECT - 1] || "",
+      };
+    }
+  }
+
+  return null;
+}
+
+function getQcExtrasByToken_(qcSheet, token) {
+  if (!qcSheet) return null;
+
+  const lastRow = qcSheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const data = qcSheet.getRange(2, 1, lastRow - 1, qcSheet.getLastColumn()).getValues();
+
+  for (let i = 0; i < data.length; i++) {
+    if ((data[i][0] || "").toString().trim() !== token.toString().trim()) continue;
+
+    return {
+      name: data[i][QC_COL.NAME - 1] || "",
+      time: data[i][QC_COL.TIME - 1] || "",
+      cart: data[i][QC_COL.CART - 1] || "",
+      paint: data[i][QC_COL.PAINT - 1] || "",
+      pending: data[i][QC_COL.PENDING - 1] || "",
+      scrap: data[i][QC_COL.SCRAP - 1] || "",
+      defect: data[i][QC_COL.DEFECT - 1] || "",
+    };
+  }
+
+  return null;
+}
+
+// ====== DELETE / CLEANUP ======
+function deleteRowEverywhere_(ss, row, token) {
+  STATIONS_IN_ORDER.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (sh && sh.getLastRow() >= row) {
+      try {
+        sh.deleteRow(row);
+      } catch (err) {
+        logError_("deleteRowEverywhere_ " + name, err);
+      }
+    }
+  });
+
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  if (logSheet) {
+    const lastRow = logSheet.getLastRow();
+    if (lastRow >= 2) {
+      const data = logSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+      for (let i = 0; i < data.length; i++) {
+        if ((data[i][0] || "").toString().trim() === token.toString().trim()) {
+          logSheet.deleteRow(i + 2);
+          break;
+        }
+      }
+    }
+  }
+}
+
+function deleteTokenFromSheets_(ss, tokens, sheetNames) {
+  const set = new Set(tokens.map(t => t.toString().trim()));
+
+  sheetNames.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return;
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) return;
+
+    const data = sh.getRange(2, 1, lastRow - 1, 1).getValues();
+    const rowsToDelete = [];
+
+    for (let i = 0; i < data.length; i++) {
+      const t = (data[i][0] || "").toString().trim();
+      if (set.has(t)) rowsToDelete.push(i + 2);
+    }
+
+    for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+      sh.deleteRow(rowsToDelete[i]);
+    }
+  });
+}
+
+function tokenExistsInColA_(sheet, token) {
+  if (!sheet) return false;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  const vals = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  const t0 = token.toString().trim();
+
+  for (let i = 0; i < vals.length; i++) {
+    if ((vals[i][0] || "").toString().trim() === t0) return true;
+  }
+
+  return false;
+}
+
+// ====== HELPERS ======
+function now_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "M/d/yyyy H:mm:ss");
+}
+
+function formatDateKey_(value) {
+  let d = value;
+  if (!(d instanceof Date)) d = new Date(d);
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), "M/d/yyyy");
+}
+
+function toastOrAlert_(ss, msg) {
+  try {
+    ss.toast(msg, "SF QR", 4);
+  } catch (e) {
+    try {
+      SpreadsheetApp.getUi().alert(msg);
+    } catch (err) {}
+  }
+}
+
+function logError_(where, err) {
+  Logger.log(`[${where}] ${err && err.message ? err.message : err}`);
+}
+/***************************************
+ * LIVE REPAIR TOOLS
+ * Rebuild station tabs from Forming row order
+ * Safe approach:
+ * - Uses Forming as master row map
+ * - Preserves the fullest existing row per token from target tab
+ * - Forces A:D to match Forming
+ * - Does NOT delete rows
+ ***************************************/
+
+function liveRepairPreviewCounts() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const forming = ss.getSheetByName("Forming");
+  if (!forming) throw new Error("Forming sheet not found.");
+
+  const targetSheets = ["Flex", "Pitching", "Sprayfoam", "Bandsaw", "QC"];
+  const formingLastRow = forming.getLastRow();
+  if (formingLastRow < 2) throw new Error("Forming has no data.");
+
+  const formingTokens = forming.getRange(2, 1, formingLastRow - 1, 1).getValues().flat()
+    .map(v => (v || "").toString().trim());
+
+  const report = [];
+
+  targetSheets.forEach(sheetName => {
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) {
+      report.push([sheetName, "MISSING SHEET", "", "", ""]);
+      return;
+    }
+
+    const lastRow = sh.getLastRow();
+    const lastCol = sh.getLastColumn();
+    const rowCount = Math.max(lastRow - 1, formingTokens.length);
+
+    let data = [];
+    if (rowCount > 0) {
+      data = sh.getRange(2, 1, rowCount, Math.min(lastCol, 4)).getValues();
+    }
+
+    let aligned = 0;
+    let wrongRow = 0;
+    let blankWhereFormingHasToken = 0;
+
+    for (let i = 0; i < formingTokens.length; i++) {
+      const formingToken = formingTokens[i];
+      const targetToken = ((data[i] && data[i][0]) || "").toString().trim();
+
+      if (!formingToken) continue;
+      if (!targetToken) {
+        blankWhereFormingHasToken++;
+      } else if (targetToken === formingToken) {
+        aligned++;
+      } else {
+        wrongRow++;
+      }
+    }
+
+    report.push([sheetName, aligned, wrongRow, blankWhereFormingHasToken, rowCount]);
+  });
+
+  const previewSheetName = "_Repair Preview";
+  let preview = ss.getSheetByName(previewSheetName);
+  if (!preview) preview = ss.insertSheet(previewSheetName);
+  preview.clear();
+  preview.getRange(1, 1, 1, 5).setValues([["Sheet", "Aligned Rows", "Wrong Token On Row", "Blank Where Forming Has Token", "Rows Checked"]]);
+  if (report.length) {
+    preview.getRange(2, 1, report.length, 5).setValues(report);
+  }
+
+  ss.toast("Repair preview complete ✅", "SF QR", 5);
+}
+
+function repairOneStationTabFromForming(sheetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const forming = ss.getSheetByName("Forming");
+  const target = ss.getSheetByName(sheetName);
+
+  if (!forming) throw new Error("Forming sheet not found.");
+  if (!target) throw new Error("Target sheet not found: " + sheetName);
+
+  const formingLastRow = forming.getLastRow();
+  if (formingLastRow < 2) throw new Error("Forming has no data.");
+
+  const targetLastCol = target.getLastColumn();
+
+  // Master rows from Forming A:D
+  const formingRowsAD = forming.getRange(2, 1, formingLastRow - 1, 4).getValues();
+
+  // Read enough rows from target to cover either current target or forming size
+  const targetReadRows = Math.max(target.getLastRow() - 1, formingRowsAD.length);
+  const targetRows = targetReadRows > 0
+    ? target.getRange(2, 1, targetReadRows, targetLastCol).getValues()
+    : [];
+
+  function isBlank(v) {
+    return v === "" || v === null;
+  }
+
+  function filledCount(row) {
+    let count = 0;
+    for (let i = 0; i < row.length; i++) {
+      if (!isBlank(row[i])) count++;
+    }
+    return count;
+  }
+
+  // Keep the fullest row for each token in the damaged target tab
+  const bestRowByToken = {};
+  for (let i = 0; i < targetRows.length; i++) {
+    const row = targetRows[i];
+    const token = (row[0] || "").toString().trim();
+    if (!token) continue;
+
+    if (!bestRowByToken[token] || filledCount(row) > filledCount(bestRowByToken[token])) {
+      bestRowByToken[token] = row.slice();
+    }
+  }
+
+  // Build repaired rows in Forming order
+  const rebuilt = [];
+  for (let i = 0; i < formingRowsAD.length; i++) {
+    const formingAD = formingRowsAD[i];
+    const token = (formingAD[0] || "").toString().trim();
+
+    // If Forming row is blank, keep row blank
+    if (!token) {
+      rebuilt.push(new Array(targetLastCol).fill(""));
+      continue;
+    }
+
+    let newRow = bestRowByToken[token]
+      ? bestRowByToken[token].slice()
+      : new Array(targetLastCol).fill("");
+
+    // Force A:D to match Forming exactly
+    newRow[0] = formingAD[0] || "";
+    newRow[1] = formingAD[1] || "";
+    newRow[2] = formingAD[2] || "";
+    newRow[3] = formingAD[3] || "";
+
+    rebuilt.push(newRow);
+  }
+
+  // Ensure enough physical rows
+  const neededRows = rebuilt.length + 1; // + header
+  if (target.getMaxRows() < neededRows) {
+    target.insertRowsAfter(target.getMaxRows(), neededRows - target.getMaxRows());
+  }
+
+  // Write repaired rows back
+  if (rebuilt.length) {
+    target.getRange(2, 1, rebuilt.length, targetLastCol).setValues(rebuilt);
+  }
+
+  ss.toast("Repaired " + sheetName + " ✅", "SF QR", 5);
+}
+
+function repairFlex() {
+  repairOneStationTabFromForming("Flex");
+}
+
+function repairPitching() {
+  repairOneStationTabFromForming("Pitching");
+}
+
+function repairSprayfoam() {
+  repairOneStationTabFromForming("Sprayfoam");
+}
+
+function repairBandsaw() {
+  repairOneStationTabFromForming("Bandsaw");
+}
+
+function repairQC() {
+  repairOneStationTabFromForming("QC");
+}
+
+function repairAllStationTabsFromForming() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lock = LockService.getDocumentLock();
+
+  try {
+    if (!lock.tryLock(5000)) {
+      ss.toast("Could not get lock for repair. Try again in a moment.", "SF QR", 5);
+      return;
+    }
+
+    repairOneStationTabFromForming("Flex");
+    repairOneStationTabFromForming("Pitching");
+    repairOneStationTabFromForming("Sprayfoam");
+    repairOneStationTabFromForming("Bandsaw");
+    repairOneStationTabFromForming("QC");
+
+    ss.toast("All station tabs repaired ✅", "SF QR", 6);
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {}
+  }
+}
+function clearDuplicateTokensInTab(sheetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(sheetName);
+  if (!sh) throw new Error("Sheet not found: " + sheetName);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2) return;
+
+  const data = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  function filledCount(row) {
+    return row.filter(v => v !== "" && v !== null).length;
+  }
+
+  const keepRowByToken = {};
+  const duplicateRowsToClear = [];
+
+  for (let i = 0; i < data.length; i++) {
+    const token = (data[i][0] || "").toString().trim();
+    if (!token) continue;
+
+    const actualRow = i + 2;
+    const currentCount = filledCount(data[i]);
+
+    if (!keepRowByToken[token]) {
+      keepRowByToken[token] = { row: actualRow, count: currentCount };
+      continue;
+    }
+
+    if (currentCount > keepRowByToken[token].count) {
+      duplicateRowsToClear.push(keepRowByToken[token].row);
+      keepRowByToken[token] = { row: actualRow, count: currentCount };
+    } else {
+      duplicateRowsToClear.push(actualRow);
+    }
+  }
+
+  duplicateRowsToClear.sort((a, b) => a - b);
+
+  duplicateRowsToClear.forEach(r => {
+    sh.getRange(r, 1, 1, lastCol).clearContent();
+  });
+
+  ss.toast(`Cleared duplicate token rows in ${sheetName} ✅`, "SF QR", 5);
+}
+function clearDupesFlex() {
+  clearDuplicateTokensInTab("Flex");
+}
+
+function clearDupesPitching() {
+  clearDuplicateTokensInTab("Pitching");
+}
+
+function clearDupesSprayfoam() {
+  clearDuplicateTokensInTab("Sprayfoam");
+}
+
+function clearDupesBandsaw() {
+  clearDuplicateTokensInTab("Bandsaw");
+}
+
+function clearDupesQC() {
+  clearDuplicateTokensInTab("QC");
+}
+function processCurrentFormingRowManually() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+
+  if (!sheet || sheet.getName() !== SHEETS.FORMING) {
+    ss.toast("Go to the Forming tab first.", "SF QR", 4);
+    return;
+  }
+
+  const row = sheet.getActiveCell().getRow();
+  if (row <= 1) {
+    ss.toast("Select a data row in Forming first.", "SF QR", 4);
+    return;
+  }
+
+  const tokenValue = (sheet.getRange(row, FORMING_COL.TOKEN).getValue() || "").toString().trim();
+  if (!tokenValue) {
+    ss.toast("No token found in column A for this row.", "SF QR", 5);
+    return;
+  }
+
+  const input = sheet.getRange(row, FORMING_COL.SCAN).getValue();
+  if (!input) {
+    ss.toast("No QR data found in column H for this row.", "SF QR", 5);
+    return;
+  }
+
+  const inputStr = input.toString().trim();
+  if (!inputStr.includes("|")) {
+    ss.toast("QR data in H does not contain | and cannot be split.", "SF QR", 5);
+    return;
+  }
+
+  const existing = sheet.getRange(row, FORMING_COL.ORDER, 1, 5).getValues()[0]; // B:F
+  const isOccupied = existing.some(v => v !== "" && v !== null);
+  if (isOccupied) {
+    ss.toast("B:F already contain data on this row.", "SF QR", 5);
+    return;
+  }
+
+  const split = inputStr.split("|").map(s => s.trim()).filter(Boolean);
+  const padded = [...split];
+  while (padded.length < 5) padded.push("");
+
+  // Fill B:F
+  sheet.getRange(row, FORMING_COL.ORDER, 1, 5).setValues([padded.slice(0, 5)]);
+
+  const ts = now_();
+  sheet.getRange(row, FORMING_COL.TIME).setValue(ts);
+  sheet.getRange(row, FORMING_COL.SUCCESS).setValue("✅");
+  sheet.getRange(row, FORMING_COL.SCAN).clearContent();
+
+  // Copy A:D to other station tabs
+  const dataToCopy = sheet.getRange(row, 1, 1, 4).getValues();
+  STATIONS_IN_ORDER.forEach(name => {
+    if (name === SHEETS.FORMING) return;
+    const target = ss.getSheetByName(name);
+    if (!target) return;
+    target.getRange(row, 1, 1, 4).setValues(dataToCopy);
+  });
+
+  // Update Status Log
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+  const formingRow = getFormingRowByRow_(sheet, row);
+
+  updateStatusLog_(logSheet, tokenValue, {
+    area: SHEETS.FORMING,
+    name: "",
+    timestamp: ts,
+    cart: "",
+    combinedStatus: "Forming",
+    formingRow,
+  });
+
+  markDashboardDirty_();
+  ss.toast("Forming row processed manually ✅", "SF QR", 5);
+}
+function processStuckFormingRows() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEETS.FORMING);
+  if (!sheet) return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  const logSheet = ss.getSheetByName(SHEETS.STATUS_LOG);
+
+  for (let i = 0; i < data.length; i++) {
+    const row = i + 2;
+
+    const token = (data[i][FORMING_COL.TOKEN - 1] || "").toString().trim();
+    const order = data[i][FORMING_COL.ORDER - 1];
+    const part = data[i][FORMING_COL.PART - 1];
+    const size = data[i][FORMING_COL.SIZE - 1];
+    const customer = data[i][FORMING_COL.CUSTOMER - 1];
+    const dueDate = data[i][FORMING_COL.DUEDATE - 1];
+    const scanVal = (data[i][FORMING_COL.SCAN - 1] || "").toString().trim();
+
+    const bfBlank =
+      (order === "" || order === null) &&
+      (part === "" || part === null) &&
+      (size === "" || size === null) &&
+      (customer === "" || customer === null) &&
+      (dueDate === "" || dueDate === null);
+
+    if (!token) continue;
+    if (!scanVal) continue;
+    if (!scanVal.includes("|")) continue;
+    if (!bfBlank) continue;
+
+    const split = scanVal.split("|").map(s => s.trim()).filter(Boolean);
+    const padded = [...split];
+    while (padded.length < 5) padded.push("");
+
+    sheet.getRange(row, FORMING_COL.ORDER, 1, 5).setValues([padded.slice(0, 5)]);
+
+    const ts = now_();
+    sheet.getRange(row, FORMING_COL.TIME).setValue(ts);
+    sheet.getRange(row, FORMING_COL.SUCCESS).setValue("✅");
+    sheet.getRange(row, FORMING_COL.SCAN).clearContent();
+
+    const dataToCopy = sheet.getRange(row, 1, 1, 4).getValues();
+    STATIONS_IN_ORDER.forEach(name => {
+      if (name === SHEETS.FORMING) return;
+      const target = ss.getSheetByName(name);
+      if (!target) return;
+      target.getRange(row, 1, 1, 4).setValues(dataToCopy);
+    });
+
+    const formingRow = getFormingRowByRow_(sheet, row);
+    updateStatusLog_(logSheet, token, {
+      area: SHEETS.FORMING,
+      name: "",
+      timestamp: ts,
+      cart: "",
+      combinedStatus: "Forming",
+      formingRow,
+    });
+
+    markDashboardDirty_();
+  }
+}
